@@ -1162,6 +1162,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "smallvec",
  "tokio",
  "tracing",
  "tracing-subscriber",

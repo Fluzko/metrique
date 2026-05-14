@@ -9,6 +9,8 @@
 //! [`DescriptorRef`] and [`FieldView`] accessors.
 
 use std::any::TypeId;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use smallvec::SmallVec;
 
@@ -231,29 +233,31 @@ impl<'a> FieldView<'a> {
 /// Opaque identifier for a descriptor segment, stable within a process lifetime.
 ///
 /// Intended for caching and deduplication by sinks. Two `DescriptorRef`s backed by
-/// the same static with the same modifiers produce equal ids. Collisions are
-/// theoretically possible (weak hash) but extremely unlikely in practice.
+/// the same static with the same modifiers produce equal ids. Inputs (the
+/// underlying static descriptor, prefix strings, and tag-layer slices) are all
+/// `&'static`, so their addresses are stable across the run.
 ///
-/// For a single cache key covering an entire entry (all segments), combine the
-/// sequence of ids from `entry.descriptors()`.
+/// For a single cache key covering an entire entry (all segments), feed the
+/// sequence of ids from `entry.descriptors()` into a `HashMap` directly — the
+/// id is already a strong hash, so no further mixing is required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DescriptorId(u64);
 
 impl DescriptorId {
-    // TODO: consider using fxhash instead to be a bit more collision resistant
     fn compute(
         descriptor: &EntryDescriptor,
         prefixes: &[&'static str],
         tag_layers: &[&'static [FieldTag]],
     ) -> Self {
-        let mut id = descriptor as *const EntryDescriptor as u64;
+        let mut h = DefaultHasher::new();
+        (descriptor as *const EntryDescriptor as usize).hash(&mut h);
         for p in prefixes {
-            id = id.wrapping_mul(31).wrapping_add(p.as_ptr() as u64);
+            (p.as_ptr() as usize).hash(&mut h);
         }
         for layer in tag_layers {
-            id = id.wrapping_mul(31).wrapping_add(layer.as_ptr() as u64);
+            (layer.as_ptr() as usize).hash(&mut h);
         }
-        DescriptorId(id)
+        DescriptorId(h.finish())
     }
 }
 

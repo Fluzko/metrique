@@ -11,7 +11,6 @@ pub use metrics::InstrumentKind;
 
 use std::{
     collections::{HashMap, HashSet},
-    hash::Hasher,
     sync::{Arc, RwLock},
 };
 
@@ -21,9 +20,10 @@ use metrique_writer_core::{
     sink::{EntrySink, FlushWait},
 };
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
+use smallvec::SmallVec;
 
 use crate::{
-    metrics::InstrumentCache,
+    metrics::{FallbackCache, InstrumentBuilder},
     translator::{EntryPlan, OtelEntryWriter},
 };
 
@@ -34,16 +34,31 @@ pub struct OtelSink {
 
 struct OtelSinkInner {
     meter_provider: SdkMeterProvider,
-    instruments: InstrumentCache,
-    /// Cache of resolved entry plans, keyed by a hash of the entry's
-    /// descriptor segment ids. Built lazily on first sight of each shape.
-    plans: RwLock<HashMap<u64, Arc<EntryPlan>>>,
+    /// Builds OTel instruments at plan-build time. Holds no map and no lock;
+    /// the resolved instruments live on the per-shape [`EntryPlan`].
+    builder: InstrumentBuilder,
+    /// Lazy cache for instruments resolved at write time rather than
+    /// plan-build time — only hit by the residual fallback paths (entries
+    /// with no descriptors, or `Distribution`-flagged metrics whose field
+    /// name isn't in the plan).
+    fallback_cache: FallbackCache,
+    /// Cache of resolved entry plans, keyed by the sequence of
+    /// [`DescriptorId`]s emitted by the entry. `SmallVec` keeps the
+    /// 1-segment case (the common one) heap-free at lookup time, and the
+    /// `HashMap`'s own hasher does the only SipHash pass over the sequence.
+    plans: RwLock<HashMap<PlanKey, Arc<EntryPlan>>>,
     /// Descriptor cache-keys for which we have already emitted the
     /// "unclassified field" warning. Lets the warning fire once per shape
     /// even though `append` runs on every entry.
-    warned: RwLock<HashSet<u64>>,
+    warned: RwLock<HashSet<PlanKey>>,
     fallback_plan: Arc<EntryPlan>,
 }
+
+/// Identity of an entry shape for plan-cache lookup. Built by walking
+/// [`Entry::descriptors`] and collecting each segment's [`DescriptorId`].
+/// Inline storage for 1-segment entries (the common case); the heap kicks
+/// in only for composed entries (e.g. aggregation results).
+type PlanKey = SmallVec<[DescriptorId; 1]>;
 
 impl OtelSink {
     pub fn builder() -> OtelSinkBuilder {
@@ -90,30 +105,39 @@ impl OtelSink {
     /// Resolve the cached plan for an entry, building one if this is the
     /// first time we've seen this shape. Returns the fallback plan if the
     /// entry emits no descriptors.
+    ///
+    /// Steady state (cache hit) walks `entry.descriptors()` once to build a
+    /// `PlanKey` — stack-allocated for the common 1-segment case — then does
+    /// a read-locked map lookup. On miss it walks `descriptors()` a second
+    /// time to collect the full `DescriptorRef`s for plan construction.
     fn plan_for<E: Entry>(&self, entry: &E) -> Arc<EntryPlan> {
-        let segments: Vec<_> = entry.descriptors().collect();
-        if segments.is_empty() {
+        let mut key: PlanKey = SmallVec::new();
+        for d in entry.descriptors() {
+            key.push(d.id());
+        }
+        if key.is_empty() {
             return Arc::clone(&self.inner.fallback_plan);
         }
-
-        let cache_key = compute_cache_key(&segments);
 
         if let Some(plan) = self
             .inner
             .plans
             .read()
             .expect("plan cache read poisoned")
-            .get(&cache_key)
+            .get(&key)
             .cloned()
         {
             return plan;
         }
 
-        let plan = Arc::new(EntryPlan::from_descriptors(&segments));
+        // Miss: rebuild segments and construct the plan. `Entry::descriptors`
+        // takes `&self`, so re-invoking yields a fresh iterator.
+        let segments: Vec<_> = entry.descriptors().collect();
+        let plan = Arc::new(EntryPlan::from_descriptors(&segments, &self.inner.builder));
 
         if !plan.unclassified.is_empty() {
             let mut warned = self.inner.warned.write().expect("warned cache poisoned");
-            if warned.insert(cache_key) {
+            if warned.insert(key.clone()) {
                 let scope = &plan.scope;
                 let fields: Vec<&str> = plan.unclassified.iter().map(String::as_str).collect();
                 tracing::warn!(
@@ -126,13 +150,15 @@ impl OtelSink {
             }
         }
 
+        // Use the canonical Arc — if another thread raced us, `or_insert_with`
+        // keeps the first-write winner and we return that, not our local copy.
         self.inner
             .plans
             .write()
             .expect("plan cache write poisoned")
-            .entry(cache_key)
-            .or_insert_with(|| Arc::clone(&plan));
-        plan
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&plan))
+            .clone()
     }
 
     #[cfg(test)]
@@ -143,18 +169,6 @@ impl OtelSink {
             .expect("plan cache read poisoned")
             .len()
     }
-}
-
-fn compute_cache_key(segments: &[metrique_writer_core::descriptor::DescriptorRef<'_>]) -> u64 {
-    // DescriptorId is already Hash, so feeding it in directly preserves
-    // any structural distinctions baked into `DescriptorId::compute`.
-    use std::hash::Hash;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for d in segments {
-        let id: DescriptorId = d.id();
-        id.hash(&mut h);
-    }
-    h.finish()
 }
 
 #[non_exhaustive]
@@ -209,11 +223,13 @@ impl OtelSinkBuilder {
             }
             b.build()
         });
-        let instruments = InstrumentCache::new(meter_provider.clone());
+        let builder = InstrumentBuilder::new(meter_provider.clone());
+        let fallback_cache = FallbackCache::new(builder.clone());
         OtelSink {
             inner: Arc::new(OtelSinkInner {
                 meter_provider,
-                instruments,
+                builder,
+                fallback_cache,
                 plans: RwLock::new(HashMap::new()),
                 warned: RwLock::new(HashSet::new()),
                 fallback_plan: Arc::new(EntryPlan::fallback()),
@@ -225,7 +241,7 @@ impl OtelSinkBuilder {
 impl<E: Entry + Send + 'static> EntrySink<E> for OtelSink {
     fn append(&self, entry: E) {
         let plan = self.plan_for(&entry);
-        let mut writer = OtelEntryWriter::new(&self.inner.instruments, &plan);
+        let mut writer = OtelEntryWriter::new(&plan, &self.inner.fallback_cache);
         entry.write(&mut writer);
         writer.finish();
     }
