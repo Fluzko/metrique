@@ -12,34 +12,39 @@ use metrique_writer_core::{
 use opentelemetry::KeyValue;
 
 use crate::{
-    metrics::{InstrumentCache, InstrumentKind},
+    metrics::{CachedInstrument, FallbackCache, InstrumentBuilder, InstrumentKind, record_observations},
     tags,
 };
 
-/// Resolution of a single field's instrument kind, built once per
-/// [`DescriptorId`](metrique_writer_core::descriptor::DescriptorId).
-#[derive(Clone, Debug)]
-pub(crate) struct FieldKind {
-    pub(crate) kind: InstrumentKind,
+/// One field's pre-resolved OTel instrument.
+///
+/// Built once at plan-build time and reused across every write of the same
+/// entry shape — the hot path holds a borrow into the plan and clones this
+/// instrument's `Arc`-backed handle without touching any external lock.
+/// The kind is encoded in the [`CachedInstrument`] variant.
+#[derive(Clone)]
+pub(crate) struct FieldInstrument {
+    pub(crate) instrument: CachedInstrument,
 }
 
 /// Pre-resolved plan for one entry shape: how to handle each named field at
-/// write time without walking the descriptor again. `kinds` maps the
+/// write time without walking the descriptor again. `fields` maps the
 /// runtime field name (the same string the macro/`Value` impl passes to
-/// [`ValueWriter::metric`]) to the OTel instrument kind tagged on the field.
+/// [`ValueWriter::metric`]) to a fully resolved OTel instrument.
 ///
-/// Field names not present in `kinds` fall back to runtime classification:
+/// Field names not present in `fields` fall back to runtime classification:
 /// strings become attributes; metrics with the [`Distribution`] flag map to
-/// a histogram; anything else is dropped and counted as unclassified.
+/// a histogram resolved via [`FallbackCache`]; anything else is dropped and
+/// counted as unclassified.
 ///
 /// `scope` is `&'static str` because the OTel `MeterProvider::meter()` API
 /// requires it; we intern via `Box::leak` once per unique entry shape at
 /// plan-build time, which leaks O(#entry_types) bytes for the process —
 /// acceptable in exchange for keeping the plan cheap to share.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct EntryPlan {
     pub(crate) scope: &'static str,
-    pub(crate) kinds: HashMap<String, FieldKind>,
+    pub(crate) fields: HashMap<String, FieldInstrument>,
     /// Names of fields that arrived from a descriptor but carried no
     /// instrument-kind tag. Captured at plan-build time so we can warn once
     /// per descriptor rather than once per write.
@@ -48,25 +53,31 @@ pub(crate) struct EntryPlan {
 
 impl EntryPlan {
     /// Plan for a hand-rolled `Entry` that emits no descriptors. Strings
-    /// become attributes; only `Distribution`-flagged metrics are recorded.
+    /// become attributes; only `Distribution`-flagged metrics are recorded,
+    /// resolved through the sink's fallback cache.
     pub(crate) fn fallback() -> Self {
         Self {
             scope: "metrique-otel",
-            kinds: HashMap::new(),
+            fields: HashMap::new(),
             unclassified: Vec::new(),
         }
     }
 
     /// Build a plan from one or more descriptor segments emitted by a single
-    /// entry. The meter scope name is taken from the first segment's
-    /// canonical entry name.
-    pub(crate) fn from_descriptors(segments: &[DescriptorRef<'_>]) -> Self {
+    /// entry. For every tagged field, the matching OTel instrument is
+    /// constructed up front from the descriptor's declared unit, so the
+    /// hot path never has to consult a cache. The meter scope name is taken
+    /// from the first segment's canonical entry name.
+    pub(crate) fn from_descriptors(
+        segments: &[DescriptorRef<'_>],
+        builder: &InstrumentBuilder,
+    ) -> Self {
         let scope: &'static str = match segments.first() {
             Some(d) => Box::leak(format!("metrique/{}", d.name()).into_boxed_str()),
             None => "metrique-otel",
         };
 
-        let mut kinds = HashMap::new();
+        let mut fields = HashMap::new();
         let mut unclassified = Vec::new();
         for desc in segments {
             for field in desc.fields() {
@@ -76,7 +87,12 @@ impl EntryPlan {
                 }
                 match resolve_kind(&field) {
                     Some(kind) => {
-                        kinds.insert(full, FieldKind { kind });
+                        // Descriptor-declared unit wins; fields without a
+                        // declared unit fall back to dimensionless. The OTel
+                        // instrument's unit is fixed at construction time.
+                        let unit = field.unit().unwrap_or(Unit::None);
+                        let instrument = builder.build(scope, &full, kind, unit);
+                        fields.insert(full, FieldInstrument { instrument });
                     }
                     None => {
                         unclassified.push(full);
@@ -87,7 +103,7 @@ impl EntryPlan {
 
         Self {
             scope,
-            kinds,
+            fields,
             unclassified,
         }
     }
@@ -120,20 +136,24 @@ fn resolve_kind(field: &metrique_writer_core::descriptor::FieldView<'_>) -> Opti
 }
 
 /// A pending metric observation captured during `Entry::write`, replayed
-/// against the instrument cache once we have the full entry-level attribute
-/// set. Buffering is what lets a string field declared *after* a metric
-/// field still ride along as an attribute on that metric.
+/// once we have the full entry-level attribute set. Buffering is what lets
+/// a string field declared *after* a metric field still ride along as an
+/// attribute on that metric.
+///
+/// The resolved instrument is carried directly (cheap `Arc`-clone), so
+/// `finish()` never needs to look anything up.
 struct PendingMetric {
-    name: String,
-    kind: InstrumentKind,
+    instrument: CachedInstrument,
     observations: Vec<Observation>,
-    unit: Unit,
     per_metric_dimensions: Vec<KeyValue>,
 }
 
 pub(crate) struct OtelEntryWriter<'sink, 'plan> {
-    pub(crate) cache: &'sink InstrumentCache,
     pub(crate) plan: &'plan EntryPlan,
+    /// Used only when an emitted field name isn't in `plan.fields` — i.e. the
+    /// hand-rolled-entry path, or a descriptor-driven entry that emits an
+    /// unexpected field with the `Distribution` flag.
+    pub(crate) fallback_cache: &'sink FallbackCache,
     /// String fields collected during the walk; applied as attributes to
     /// every metric in this entry at `finish()` time.
     entry_attributes: Vec<KeyValue>,
@@ -141,10 +161,10 @@ pub(crate) struct OtelEntryWriter<'sink, 'plan> {
 }
 
 impl<'sink, 'plan> OtelEntryWriter<'sink, 'plan> {
-    pub(crate) fn new(cache: &'sink InstrumentCache, plan: &'plan EntryPlan) -> Self {
+    pub(crate) fn new(plan: &'plan EntryPlan, fallback_cache: &'sink FallbackCache) -> Self {
         Self {
-            cache,
             plan,
+            fallback_cache,
             entry_attributes: Vec::new(),
             pending: Vec::new(),
         }
@@ -158,14 +178,7 @@ impl<'sink, 'plan> OtelEntryWriter<'sink, 'plan> {
             // user-data problem, not something to paper over here.
             let mut attributes = m.per_metric_dimensions;
             attributes.extend(self.entry_attributes.iter().cloned());
-            self.cache.record(
-                self.plan.scope,
-                &m.name,
-                m.kind,
-                m.observations,
-                m.unit,
-                &attributes,
-            );
+            record_observations(&m.instrument, m.observations, &attributes);
         }
     }
 }
@@ -208,17 +221,25 @@ impl<'a, 'sink, 'plan> ValueWriter for OtelValueWriter<'a, 'sink, 'plan> {
         dimensions: impl IntoIterator<Item = (&'b str, &'b str)>,
         flags: MetricFlags<'_>,
     ) {
-        // Resolve the instrument kind:
-        //   1. Plan-provided kind tag wins (descriptor-driven).
-        //   2. `Distribution` flag (from metrique-aggregation's histogram
-        //      strategy) maps to a histogram instrument.
-        //   3. Anything else is unclassified and dropped, a one-time warn
+        // Resolve the instrument:
+        //   1. Descriptor-tagged field → pre-built instrument from the plan
+        //      (cheap Arc clone, no lock).
+        //   2. `Distribution` flag on an un-tagged field → histogram looked
+        //      up in the fallback cache (RwLock read-fast-path).
+        //   3. Anything else is unclassified and dropped; the one-time warn
         //      is emitted at plan-build time for descriptors that contain
         //      such fields.
-        let kind = match self.parent.plan.kinds.get(self.name.as_ref()) {
-            Some(fk) => fk.kind,
-            None if flags.downcast::<Distribution>().is_some() => InstrumentKind::Histogram,
-            None => return,
+        let instrument = if let Some(fi) = self.parent.plan.fields.get(self.name.as_ref()) {
+            fi.instrument.clone()
+        } else if flags.downcast::<Distribution>().is_some() {
+            self.parent.fallback_cache.get_or_build(
+                self.parent.plan.scope,
+                self.name.as_ref(),
+                InstrumentKind::Histogram,
+                unit,
+            )
+        } else {
+            return;
         };
 
         let per_metric_dimensions: Vec<KeyValue> = dimensions
@@ -226,10 +247,8 @@ impl<'a, 'sink, 'plan> ValueWriter for OtelValueWriter<'a, 'sink, 'plan> {
             .map(|(k, v)| KeyValue::new(k.to_owned(), v.to_owned()))
             .collect();
         self.parent.pending.push(PendingMetric {
-            name: self.name.into_owned(),
-            kind,
+            instrument,
             observations: distribution.into_iter().collect(),
-            unit,
             per_metric_dimensions,
         });
     }
